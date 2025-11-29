@@ -70,6 +70,7 @@ class Renderer:
 
         self.torch = None
         self.gsplat = None
+        self._render_fn = None
 
         if backend == "gsplat":
             try:
@@ -78,7 +79,15 @@ class Renderer:
 
                 self.torch = torch
                 self.gsplat = gsplat
-                self.backend_available = True
+                # gsplat API moved: older versions expose gsplat.render, newer expose gsplat.rendering.render
+                if hasattr(gsplat, "render"):
+                    self._render_fn = gsplat.render  # type: ignore[attr-defined]
+                    self.backend_available = True
+                elif hasattr(gsplat, "rendering") and hasattr(gsplat.rendering, "render"):
+                    self._render_fn = gsplat.rendering.render  # type: ignore[attr-defined]
+                    self.backend_available = True
+                else:
+                    print("gsplat found but no render function; rendering disabled.")
             except ImportError:
                 print("gsplat not available; falling back to dry-run.")
 
@@ -100,7 +109,7 @@ class Renderer:
             return None
 
         torch = self.torch  # type: ignore
-        assert torch is not None and self.gsplat is not None
+        assert torch is not None and self._render_fn is not None
         gaussians = self._load_gaussians()
         fx = fx or float(self.width / 2)
         fy = fy or float(self.height / 2)
@@ -116,7 +125,7 @@ class Renderer:
             view = self._pose_to_w2c(pose)
             view_t = torch.tensor(view, device=self.device, dtype=torch.float32)
             try:
-                image = self.gsplat.render(
+                image = self._render_fn(
                     means3d=gaussians["means"],
                     scales=gaussians["scales"],
                     rotations=gaussians["rots"],

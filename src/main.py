@@ -66,7 +66,10 @@ def main() -> None:
 
     if args.video:
         frames_base = frames_dir if frames_dir is not None else output_dir / "frames"
-        assemble_video(frames_base, output_dir / "trajectory.mp4", fps=args.fps)
+        if frames_base.exists() and any(frames_base.glob("frame_*.png")):
+            assemble_video(frames_base, output_dir / "trajectory.mp4", fps=args.fps)
+        else:
+            print("Skipping video assembly: no frames found. Enable --render or ensure frames exist.")
 
     print(f"Done. Outputs saved to {output_dir}")
 

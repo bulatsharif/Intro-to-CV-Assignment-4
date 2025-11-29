@@ -181,6 +181,11 @@ class PathPlanner:
         distances = np.zeros(len(points))
         distances[1:] = np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))
         total = distances[-1]
+        # Ensure strictly increasing to satisfy CubicSpline
+        for i in range(1, len(distances)):
+            if distances[i] <= distances[i - 1]:
+                distances[i] = distances[i - 1] + 1e-4
+        total = distances[-1]
         if total <= 1e-6:
             interp = np.repeat(points[:1], num_frames, axis=0)
             tangents = np.zeros_like(interp)
