@@ -211,6 +211,14 @@ class PathPlanner:
             right /= right_norm
             up_corrected = np.cross(forward, right)
             rot = np.stack([right, up_corrected, -forward], axis=1)
+
+            # Enforce right-handed, non-degenerate rotation.
+            det = np.linalg.det(rot)
+            if det < 0:
+                rot[:, 0] *= -1  # flip right vector
+            if not np.isfinite(rot).all() or abs(np.linalg.det(rot)) < 1e-6:
+                rot = np.eye(3)
+
             quat = R.from_matrix(rot).as_quat()
             quats.append(quat)
         return np.asarray(quats)
@@ -227,6 +235,8 @@ class PathPlanner:
         right /= np.linalg.norm(right) + 1e-9
         up_corrected = np.cross(forward, right)
         rot = np.stack([right, up_corrected, -forward], axis=1)
+        if np.linalg.det(rot) < 0:
+            rot[:, 0] *= -1
         return R.from_matrix(rot).as_quat()
 
     def _look_forward(self, forward: np.ndarray) -> np.ndarray:
@@ -238,6 +248,8 @@ class PathPlanner:
         right /= np.linalg.norm(right) + 1e-9
         up_corrected = np.cross(forward, right)
         rot = np.stack([right, up_corrected, -forward], axis=1)
+        if np.linalg.det(rot) < 0:
+            rot[:, 0] *= -1
         return R.from_matrix(rot).as_quat()
 
     @staticmethod
