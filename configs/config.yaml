@@ -1,0 +1,40 @@
+defaults:
+  - _self_
+
+scene_path: input-data/Theater_uncompressed.ply
+
+exploration:
+  grid_resolution: 0.5        # meters per cell in occupancy grid
+  clearance_m: 0.35           # how far the camera should stay from splats/obstacles
+  num_waypoints: 12
+  camera_height: 1.6
+  room_height: 2.4
+  max_step_m: 0.8
+  smoothing_samples: 15
+  look_ahead: 2               # how many steps ahead to compute look direction
+  fps: 24
+  seed: 17
+
+render:
+  renderer: taichi            # taichi | gsplat
+  width: 960
+  height: 540
+  fov_y_deg: 75.0
+  output_dir: outputs/theater
+  output_name: panorama_tour.mp4
+  preview: false
+  preview_stride: 3
+  enable_360: true
+  orbit_frames: 120
+  orbit_radius: 1.8
+  gsplat_device: cpu          # switch to cuda if available
+
+detection:
+  enable: false
+  save_json: false
+  output_json: outputs/theater/detections.json
+
+hydra:
+  run:
+    dir: outputs/runs/${now:%Y-%m-%d_%H-%M-%S}
+  output_subdir: ""
