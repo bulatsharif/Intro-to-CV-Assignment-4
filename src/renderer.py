@@ -150,29 +150,41 @@ class Renderer:
     # ------------------------------------------------------------------ #
     def _load_gaussians(self) -> Dict[str, Any]:
         ply = PlyData.read(self.ply_path)
-        v = ply["vertex"]
+        v = ply["vertex"].data
         torch = self.torch  # type: ignore
         assert torch is not None
+        names = set(v.dtype.names or [])
+
+        def need(field: str) -> np.ndarray:
+            if field not in names:
+                raise KeyError(f"PLY missing required field '{field}' for rendering")
+            return v[field]
 
         means = torch.tensor(
-            np.stack([v["x"], v["y"], v["z"]], axis=-1),
+            np.stack([need("x"), need("y"), need("z")], axis=-1),
             device=self.device,
             dtype=torch.float32,
         )
-        opacity = torch.tensor(np.clip(v["opacity"], 0.0, 1.0), device=self.device, dtype=torch.float32)
-        scales = torch.tensor(
-            np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        rots = torch.tensor(
-            np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=-1),
-            device=self.device,
-            dtype=torch.float32,
-        )
+        if "opacity" in names:
+            opacity_np = np.clip(v["opacity"], 0.0, 1.0)
+        else:
+            opacity_np = np.ones(len(v), dtype=np.float32)
+        opacity = torch.tensor(opacity_np, device=self.device, dtype=torch.float32)
+
+        if {"scale_0", "scale_1", "scale_2"} <= names:
+            scales_np = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1)
+        else:
+            scales_np = np.ones((len(v), 3), dtype=np.float32)
+        scales = torch.tensor(scales_np, device=self.device, dtype=torch.float32)
+
+        if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names:
+            rots_np = np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=-1)
+        else:
+            rots_np = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (len(v), 1))
+        rots = torch.tensor(rots_np, device=self.device, dtype=torch.float32)
 
         # SH coefficients (f_dc_*, f_rest_*)
-        sh_fields = [name for name in v.dtype.names if name.startswith("f_dc") or name.startswith("f_rest")]
+        sh_fields = [name for name in names if name.startswith("f_dc") or name.startswith("f_rest")]
         shs = None
         if sh_fields:
             shs = torch.tensor(
