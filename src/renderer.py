@@ -200,7 +200,7 @@ class Renderer:
         trans = pose.position.reshape(3, 1)
         w2c = np.eye(4)
         w2c[:3, :3] = rot.T
-        w2c[:3, 3] = -rot.T @ trans
+        w2c[:3, 3] = (-rot.T @ trans).reshape(3)
         return w2c
 
     def _write_frame(self, frames_dir: Path, idx: int, image: np.ndarray) -> None:
