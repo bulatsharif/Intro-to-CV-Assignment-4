@@ -80,6 +80,8 @@ class PathPlanner:
         start_world[1] = self.scene.floor_height + 1.5 if self.scene.floor_height is not None else center_world[1]
         start_idx = self.scene.world_to_grid(start_world)
         start_idx = self.scene.find_nearest_free(start_idx, max_radius=5)
+        if not self.scene.is_free(start_idx):
+            raise RuntimeError("Failed to find a free start voxel for explorer mode.")
 
         a_idx, _ = self._bfs_farthest(start_idx)
         b_idx, _ = self._bfs_farthest(a_idx)

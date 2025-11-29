@@ -103,7 +103,18 @@ class SceneMap:
                         candidate = (start_idx[0] + dx, start_idx[1] + dy, start_idx[2] + dz)
                         if self.is_free(candidate):
                             return candidate
-        return start_idx
+
+        # Full scan fallback to guarantee a free start if one exists.
+        if self.grid_shape:
+            gx, gy, gz = self.grid_shape
+            for x in range(gx):
+                for y in range(gy):
+                    for z in range(gz):
+                        candidate = (x, y, z)
+                        if self.is_free(candidate):
+                            return candidate
+
+        raise RuntimeError("Could not find any free voxel to start from.")
 
     # Internal pipeline --------------------------------------------------
     def _load_and_process(self) -> None:
@@ -156,7 +167,7 @@ class SceneMap:
         lines = [
             f"PLY: {self.ply_path}",
             f"Voxel size: {self.voxel_size} m",
-            f"Bounds (1-{100 - self.percentile_high}%): min={self.bounds.min_bound}, max={self.bounds.max_bound}",
+            f"Bounds ({self.percentile_low}-{self.percentile_high}%): min={self.bounds.min_bound}, max={self.bounds.max_bound}",
             f"Max dimension: {self.bounds.max_dimension:.2f} m",
             f"Occupied voxels: {occupied} / {grid_vol} ({sparsity:.2%})",
         ]

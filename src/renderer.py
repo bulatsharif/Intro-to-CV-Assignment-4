@@ -79,15 +79,15 @@ class Renderer:
 
                 self.torch = torch
                 self.gsplat = gsplat
-                # gsplat API moved: older versions expose gsplat.render, newer expose gsplat.rendering.render
-                if hasattr(gsplat, "render"):
-                    self._render_fn = gsplat.render  # type: ignore[attr-defined]
-                    self.backend_available = True
-                elif hasattr(gsplat, "rendering") and hasattr(gsplat.rendering, "render"):
-                    self._render_fn = gsplat.rendering.render  # type: ignore[attr-defined]
+                self._render_fn = self._resolve_render_fn(gsplat)
+                if self._render_fn is not None:
                     self.backend_available = True
                 else:
-                    print("gsplat found but no render function; rendering disabled.")
+                    print(
+                        "gsplat found but no known render function; rendering disabled. "
+                        "Known entrypoints: gsplat.render, gsplat.rendering.render, gsplat.rendering.forward, "
+                        "gsplat.rendering.render_cuda"
+                    )
             except ImportError:
                 print("gsplat not available; falling back to dry-run.")
 
@@ -203,6 +203,26 @@ class Renderer:
             )
 
         return {"means": means, "opacity": opacity, "scales": scales, "rots": rots, "shs": shs}
+
+    def _resolve_render_fn(self, gsplat_mod: Any):
+        """
+        Handle gsplat API differences across releases.
+        Tries a handful of known entrypoints and returns the first callable found.
+        """
+        candidates = [
+            ("render", None),
+            ("rendering", "render"),
+            ("rendering", "forward"),
+            ("rendering", "render_cuda"),
+        ]
+        for mod_attr, fn_attr in candidates:
+            target = getattr(gsplat_mod, mod_attr, None)
+            if target is None:
+                continue
+            fn = getattr(target, fn_attr, None) if fn_attr else target
+            if callable(fn):
+                return fn
+        return None
 
     def _pose_to_w2c(self, pose: CameraPose) -> np.ndarray:
         rot = R.from_quat(pose.rotation).as_matrix()
