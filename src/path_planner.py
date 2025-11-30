@@ -4,16 +4,17 @@ import heapq
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R, Slerp
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, binary_closing, label
 
 from scene_map import SceneMap
 
 
+# 26-connectivity for smoother pathfinding
 VOXEL_MOVES = [
     (dx, dy, dz)
     for dx in (-1, 0, 1)
@@ -38,193 +39,228 @@ class Trajectory:
 class PathPlanner:
     def __init__(self, scene: SceneMap) -> None:
         self.scene = scene
-        self.cost_map: Optional[np.ndarray] = None
-        self.start_voxel: Optional[Tuple[int, int, int]] = None
+        self.grid_shape = self.scene.grid_shape
+        self.interior_mask: Optional[np.ndarray] = None
+        self.exterior_mask: Optional[np.ndarray] = None
+        self.obstacle_grid: Optional[np.ndarray] = None
+        self.dist_field: Optional[np.ndarray] = None
 
     def plan(self, num_frames: int = 600) -> Trajectory:
-        assert self.scene.bounds is not None
-        
-        # 1. Build the Physics Map (Distance Field)
-        self._build_clearance_map()
-        
-        # Check scene size
-        if self.scene.bounds.max_dimension < 10.0:
-            print("[Planner] Small scene detected. Using Orbit.")
-            return self.plan_orbit(num_frames=num_frames)
+        if self.scene.grid_shape is None:
+            print("[Planner] Scene not voxelized. Using fallback Orbit.")
+            return self.plan_orbit(num_frames)
 
-        print("[Planner] Large scene detected. Using Max-Clearance Explorer.")
-        return self.plan_clearance_explorer(num_frames=num_frames)
+        print("[Planner] analyzing scene geometry...")
+        self._analyze_structure()
+        
+        # Heuristic: Do we have a substantial interior?
+        # If "Indoor" voxels account for a visible amount of space, go Indoor.
+        indoor_volume = np.sum(self.interior_mask)
+        print(f"[Planner] Detected {indoor_volume} indoor voxels.")
 
-    def _build_clearance_map(self):
+        # Threshold: ~500 voxels (approx 2.5m x 2.5m x 2.5m room at 0.5m resolution)
+        if indoor_volume > 200: 
+            print("[Planner] Enclosed building detected. Mode: INDOOR EXPLORER")
+            try:
+                return self.plan_indoor_tour(num_frames)
+            except Exception as e:
+                print(f"[Planner] Indoor planning failed ({e}). Falling back to Orbit.")
+                return self.plan_orbit(num_frames)
+        else:
+            print("[Planner] Open/Outdoor scene detected. Mode: ORBIT")
+            return self.plan_orbit(num_frames)
+
+    def _analyze_structure(self):
         """
-        Builds a cost map where narrow gaps are expensive and wide spaces are cheap.
+        Distinguishes between 'Inside' (Rooms) and 'Outside' (Sky/Void).
         """
-        assert self.scene.grid_shape is not None
         shape = self.scene.grid_shape
         
         # 1. Base Grid (1=Solid, 0=Air)
+        # We assume SceneMap provides occupied voxels.
         grid = np.zeros(shape, dtype=bool)
         for (x, y, z) in self.scene.occupied_voxels:
             if 0 <= x < shape[0] and 0 <= y < shape[1] and 0 <= z < shape[2]:
                 grid[x, y, z] = 1
         
-        # 2. Hard Boundary Cage (Force the agent to stay in the box)
-        pad = 2
-        grid[0:pad, :, :] = 1; grid[-pad:, :, :] = 1
-        grid[:, 0:pad, :] = 1; grid[:, -pad:, :] = 1
-        grid[:, :, 0:pad] = 1; grid[:, :, -pad:] = 1
-        
-        # 3. Ceiling/Floor Clamp (Heuristic for buildings)
-        if self.scene.filtered_points is not None:
-             pts_y = self.scene.filtered_points[:, 1]
-             # Hard limit: 95th percentile height is the roof
-             ceil_y = np.percentile(pts_y, 95)
-             _, cy, _ = self.scene.world_to_grid(np.array([0, ceil_y, 0]))
-             if cy < shape[1]:
-                 grid[:, cy:, :] = 1 # Mark everything above roof as solid
+        self.obstacle_grid = grid
 
-        # 4. Euclidean Distance Transform
-        # dist_field[x,y,z] = distance to nearest wall
-        print("[Planner] Computing 3D Distance Field (this may take a second)...")
-        dist_field = distance_transform_edt(1 - grid.astype(int))
-        
-        # 5. Find the "Deepest" Voxel (The Start Point)
-        # The point with the highest distance value is mathematically the center of the largest room.
-        max_dist_idx = np.argmax(dist_field)
-        self.start_voxel = np.unravel_index(max_dist_idx, shape) # type: ignore
-        print(f"[Planner] Auto-Detected Start: {self.start_voxel} (Clearance: {dist_field[self.start_voxel]:.2f} voxels)")
-        
-        # 6. Cost Map: Anti-Squeeze
-        # Cost grows exponentially as we get closer to walls.
-        # dist < 1.5 voxels (0.75m) -> Cost > 100 (Virtual Wall)
-        # dist > 5.0 voxels (2.5m) -> Cost ~ 1 (Highway)
-        self.cost_map = 1.0 + (100.0 / (dist_field**2 + 0.1))
-        
-        # Mark actual obstacles as infinite
-        self.cost_map[grid == 1] = float('inf')
+        # 2. Close Holes (Virtual Seal)
+        # Closes gaps of ~1-2 voxels (windows/doors) to define "Inside".
+        # This prevents the "Outside" flood fill from leaking in.
+        print("[Planner] sealing mesh gaps...")
+        structure = np.ones((3, 3, 3)) # 3x3x3 connectivity
+        closed_grid = binary_closing(grid, structure=structure, iterations=1)
 
-    def plan_clearance_explorer(self, num_frames: int = 600) -> Trajectory:
-        assert self.start_voxel is not None
+        # 3. Identify "Outside" via Flood Fill from corners
+        # Invert: 1=Empty, 0=Solid
+        empty_space = ~closed_grid
         
-        start_idx = self.start_voxel
-
-        # 1. Find Key Points using Clearance-Aware BFS
-        # This will find points that are "far away" but reachable via "wide paths"
-        print("[Planner] finding furthest reachable point A...")
-        a_idx, _ = self._bfs_clearance(start_idx)
-        print(f"[Planner] Point A: {a_idx}. Finding opposite Point B...")
-        b_idx, _ = self._bfs_clearance(a_idx)
-        print(f"[Planner] Point B: {b_idx}.")
-
-        # 2. Pathfinding
-        print(f"[Planner] Running Clearance-A* from {a_idx} to {b_idx}...")
-        path_grid = self._astar_clearance(a_idx, b_idx)
-        print(f"[Planner] Path Length: {len(path_grid)}")
+        # Label connected components of empty space
+        labeled, n_components = label(empty_space)
         
-        # Fallback
-        if len(path_grid) < 5:
-             print("[Planner] Path too short. Fallback A -> Start.")
-             path_grid = self._astar_clearance(start_idx, a_idx)
-
-        # 3. Smooth & Convert
-        path_world = np.stack([self.scene.grid_to_world(p) for p in path_grid], axis=0)
+        # Find which components touch the boundary of the bounding box
+        boundary_labels = set()
         
-        # Subsample heavily to let the spline smooth out the path
-        subsample_step = max(1, len(path_world) // 10)
-        control_points = path_world[::subsample_step]
-        if not np.array_equal(control_points[-1], path_world[-1]):
-            control_points = np.vstack([control_points, path_world[-1]])
+        # Check all 6 faces
+        for dim in range(3):
+            boundary_labels.update(np.unique(np.take(labeled, 0, axis=dim)))
+            boundary_labels.update(np.unique(np.take(labeled, -1, axis=dim)))
+            
+        # Create Exterior Mask (0 is usually background/solid in label output, check docs)
+        # label 0 is the 'False' region (Solid), so we skip it.
+        self.exterior_mask = np.zeros(shape, dtype=bool)
+        for l in boundary_labels:
+            if l == 0: continue 
+            self.exterior_mask |= (labeled == l)
+            
+        # 4. Identify "Inside"
+        # Inside = Empty Space AND NOT Exterior
+        # We use the original grid for "Empty Space" to allow navigation near detailed walls,
+        # but we use the closed-form calculation to define the region.
+        # Ideally: Inside is any empty voxel that isn't connected to the sky.
+        self.interior_mask = (~grid) & (~self.exterior_mask)
+
+        # 5. Distance Field (Distance to nearest SOLID obstacle)
+        # Used for centering the camera
+        self.dist_field = distance_transform_edt(~grid)
+
+    def plan_indoor_tour(self, num_frames: int) -> Trajectory:
+        # 1. Find Start Point (Deepest point inside)
+        # We mask the distance field to only consider Interior voxels
+        masked_dist = self.dist_field.copy()
+        masked_dist[~self.interior_mask] = 0
+        
+        start_idx = np.unravel_index(np.argmax(masked_dist), self.grid_shape) # type: ignore
+        
+        if masked_dist[start_idx] == 0:
+            raise RuntimeError("No valid interior point found.")
+            
+        print(f"[Planner] Start Voxel: {start_idx} (Clearance: {masked_dist[start_idx]:.2f})")
+
+        # 2. Find Keypoints (Tour)
+        # Point A: Start
+        # Point B: Furthest reachable point from A (inside)
+        target_b, _ = self._bfs_bounded(start_idx)
+        
+        # Point C: Furthest reachable point from B
+        target_c, _ = self._bfs_bounded(target_b)
+        
+        print(f"[Planner] Tour: Start->{target_b}->{target_c}->Start")
+        
+        # 3. Generate Path Segments
+        # Start -> B
+        path1 = self._astar_bounded(start_idx, target_b)
+        # B -> C
+        path2 = self._astar_bounded(target_b, target_c)
+        # C -> Start
+        path3 = self._astar_bounded(target_c, start_idx)
+        
+        # Combine
+        full_path_grid = path1 + path2[1:] + path3[1:]
+        
+        # 4. Smooth & Convert
+        path_world = np.stack([self.scene.grid_to_world(p) for p in full_path_grid], axis=0)
+        
+        # Subsample for spline
+        subsample = max(1, len(path_world) // 15)
+        control_points = path_world[::subsample]
+        # Ensure loop closure
+        if not np.allclose(control_points[0], control_points[-1]):
+             control_points = np.vstack([control_points, control_points[0]])
 
         smooth_pos, tangents = self._smooth_path(control_points, num_frames=num_frames)
         quats = self._orientations_from_tangents(smooth_pos, tangents)
         
         poses = [CameraPose(position=pos, rotation=quat) for pos, quat in zip(smooth_pos, quats)]
-        return Trajectory(poses=poses, mode="explorer")
+        return Trajectory(poses=poses, mode="indoor")
 
-    def _astar_clearance(self, start: Tuple[int, int, int], goal: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
-        open_heap: List[Tuple[float, float, Tuple[int, int, int]]] = []
-        heapq.heappush(open_heap, (0.0, 0.0, start))
-        came_from: dict = {}
-        g_score = {start: 0.0}
-
-        while open_heap:
-            _, g_curr, current = heapq.heappop(open_heap)
-            if current == goal:
-                return self._reconstruct_path(came_from, current)
-
-            for nbr in self._neighbors(current):
-                nx, ny, nz = nbr
-                if not self._is_valid(nx, ny, nz): continue
-                
-                step_cost = self.cost_map[nx, ny, nz] # type: ignore
-                
-                # Hard limit: Don't go anywhere narrower than 1.5 voxels (0.75m)
-                # This prevents squeezing through windows
-                if step_cost > 50.0: continue 
-
-                tentative_g = g_curr + step_cost
-                if tentative_g < g_score.get(nbr, float("inf")):
-                    came_from[nbr] = current
-                    g_score[nbr] = tentative_g
-                    f = tentative_g + self._euclidean(nbr, goal)
-                    heapq.heappush(open_heap, (f, tentative_g, nbr))
-        return [start]
-
-    def _bfs_clearance(self, start: Tuple[int, int, int]) -> Tuple[Tuple[int, int, int], float]:
-        """Finds the furthest point reachable via SAFE paths."""
-        visited = {start}
+    def _bfs_bounded(self, start: Tuple[int, int, int]) -> Tuple[Tuple[int, int, int], float]:
+        """BFS that strictly stays within the Interior/Boundaries."""
         q = deque([(start, 0)])
+        visited = {start}
         farthest = start
         max_dist = 0
         
         while q:
-            node, dist = q.popleft()
+            curr, dist = q.popleft()
             if dist > max_dist:
                 max_dist = dist
-                farthest = node
+                farthest = curr
             
-            for nbr in self._neighbors(node):
+            # Optimization: Don't expand too much if we just want a distant point
+            # if dist > 200: continue 
+
+            for dx, dy, dz in VOXEL_MOVES:
+                nbr = (curr[0]+dx, curr[1]+dy, curr[2]+dz)
                 if nbr in visited: continue
-                nx, ny, nz = nbr
-                if not self._is_valid(nx, ny, nz): continue
                 
-                # Same hard limit as A*
-                if self.cost_map[nx, ny, nz] > 50.0: continue # type: ignore
+                # Bounds check
+                if not (0 <= nbr[0] < self.grid_shape[0] and 
+                        0 <= nbr[1] < self.grid_shape[1] and 
+                        0 <= nbr[2] < self.grid_shape[2]):
+                    continue
+                
+                # STRICT CONSTRAINT: Must be interior or close to it
+                # We allow moving in 'interior_mask' 
+                # We disallow moving in 'exterior_mask'
+                if self.exterior_mask[nbr]: continue
+                if self.obstacle_grid[nbr]: continue
                 
                 visited.add(nbr)
                 q.append((nbr, dist + 1))
+                
         return farthest, max_dist
 
-    # --- Standard Helpers ---
-    def plan_orbit(self, num_frames=600) -> Trajectory:
-        assert self.scene.bounds is not None
-        assert self.scene.centroid is not None
-        radius = max(self.scene.bounds.max_dimension * 0.9, self.scene.voxel_size * 5)
-        base_height = self.scene.centroid[1] + self.scene.bounds.max_dimension * 0.1
-        height_variation = self.scene.bounds.max_dimension * 0.05
-        angles = np.linspace(0.0, 2 * math.pi, num_frames, endpoint=False)
-        poses = []
-        for i, theta in enumerate(angles):
-            spiral_scale = 1.0 + 0.05 * math.sin(4 * theta)
-            r = radius * spiral_scale
-            x = self.scene.centroid[0] + r * math.cos(theta)
-            z = self.scene.centroid[2] + r * math.sin(theta)
-            y = base_height + height_variation * math.sin(2 * theta)
-            pos = np.array([x, y, z])
-            quat = self._look_at(pos, self.scene.centroid)
-            poses.append(CameraPose(position=pos, rotation=quat))
-        return Trajectory(poses=poses, mode="orbit")
+    def _astar_bounded(self, start, goal) -> List[Tuple[int, int, int]]:
+        open_set = []
+        heapq.heappush(open_set, (0, start))
+        came_from = {}
+        g_score = {start: 0}
+        
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            
+            if current == goal:
+                return self._reconstruct_path(came_from, current)
+            
+            for dx, dy, dz in VOXEL_MOVES:
+                nbr = (current[0]+dx, current[1]+dy, current[2]+dz)
+                
+                if not (0 <= nbr[0] < self.grid_shape[0] and 
+                        0 <= nbr[1] < self.grid_shape[1] and 
+                        0 <= nbr[2] < self.grid_shape[2]):
+                    continue
+                
+                # Cost Calculation
+                # Base cost = 1
+                cost = 1.0
+                
+                # Penalty for being close to walls (keep away from walls)
+                dist = self.dist_field[nbr]
+                if dist < 1.0: cost += 1000 # Virtually solid
+                elif dist < 2.0: cost += 10 # Uncomfortable
+                
+                # Penalty for Exterior (Soft Barrier)
+                # We allow it with high cost if it's the only way to connect rooms
+                if self.exterior_mask[nbr]: 
+                    cost += 500.0 
+                
+                # Penalty for Obstacles
+                if self.obstacle_grid[nbr]:
+                    cost += 9999.0
+                
+                new_g = g_score[current] + cost
+                if new_g < g_score.get(nbr, float('inf')):
+                    came_from[nbr] = current
+                    g_score[nbr] = new_g
+                    priority = new_g + self._heuristic(nbr, goal)
+                    heapq.heappush(open_set, (priority, nbr))
+                    
+        return [start] # Failed
 
-    def _is_valid(self, x, y, z):
-        s = self.scene.grid_shape
-        return 0 <= x < s[0] and 0 <= y < s[1] and 0 <= z < s[2]
-
-    def _neighbors(self, node):
-        x, y, z = node
-        neighbors = []
-        for dx, dy, dz in VOXEL_MOVES:
-            neighbors.append((x+dx, y+dy, z+dz))
-        return neighbors
+    def _heuristic(self, a, b):
+        return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
 
     def _reconstruct_path(self, came_from, current):
         path = [current]
@@ -234,77 +270,110 @@ class PathPlanner:
         path.reverse()
         return path
 
+    def plan_orbit(self, num_frames=600) -> Trajectory:
+        print("[Planner] Generating safe orbit trajectory...")
+        assert self.scene.bounds is not None
+        assert self.scene.centroid is not None
+        
+        # Calculate safe radius based on bounds
+        radius = self.scene.bounds.max_dimension * 0.8
+        
+        # Height: Look from slightly above
+        y_level = self.scene.centroid[1] + (self.scene.bounds.max_dimension * 0.2)
+        center = self.scene.centroid
+        
+        poses = []
+        for i in range(num_frames):
+            theta = 2 * math.pi * (i / num_frames)
+            x = center[0] + radius * math.cos(theta)
+            z = center[2] + radius * math.sin(theta)
+            pos = np.array([x, y_level, z])
+            
+            # Simple "Look At Center"
+            poses.append(CameraPose(position=pos, rotation=self._look_at(pos, center)))
+            
+        return Trajectory(poses=poses, mode="orbit")
+
+    # --- Geometry Helpers ---
     def _smooth_path(self, points: np.ndarray, num_frames: int) -> Tuple[np.ndarray, np.ndarray]:
+        # remove duplicates
+        points = points[np.insert(np.diff(points, axis=0).astype(bool).any(1), 0, True)]
+        
         if len(points) < 4:
-            t = np.linspace(0, 1, len(points))
-            ts = np.linspace(0, 1, num_frames)
-            interp = np.stack([np.interp(ts, t, points[:, dim]) for dim in range(3)], axis=-1)
-            tangents = np.gradient(interp, axis=0)
-            return interp, tangents
-        distances = np.zeros(len(points))
-        distances[1:] = np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))
-        total_dist = distances[-1]
-        for i in range(1, len(distances)):
-            if distances[i] <= distances[i - 1]: distances[i] = distances[i - 1] + 1e-4
-        splines = [CubicSpline(distances, points[:, dim], bc_type="natural") for dim in range(3)]
-        lin_t = np.linspace(0, 1, num_frames)
-        smooth_t = 6*(lin_t**5) - 15*(lin_t**4) + 10*(lin_t**3)
-        sample_dists = smooth_t * total_dist
-        interp = np.stack([s(sample_dists) for s in splines], axis=-1)
-        tangents = np.stack([s(sample_dists, 1) for s in splines], axis=-1)
-        return interp, tangents
+            # Linear fallback
+            t_curr = np.linspace(0, 1, len(points))
+            t_new = np.linspace(0, 1, num_frames)
+            res = np.zeros((num_frames, 3))
+            tan = np.zeros((num_frames, 3))
+            for i in range(3):
+                res[:, i] = np.interp(t_new, t_curr, points[:, i])
+            # Finite diff tangents
+            tan[1:] = res[1:] - res[:-1]
+            tan[0] = tan[1]
+            return res, tan
+
+        # Cubic Spline
+        # Parameterize by distance
+        dists = np.zeros(len(points))
+        dists[1:] = np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))
+        dists /= dists[-1] # Normalize 0..1
+        
+        cs = CubicSpline(dists, points, bc_type='periodic')
+        
+        ts = np.linspace(0, 1, num_frames)
+        smooth_pos = cs(ts)
+        smooth_tan = cs(ts, 1) # First derivative
+        
+        return smooth_pos, smooth_tan
 
     def _orientations_from_tangents(self, positions: np.ndarray, tangents: np.ndarray) -> np.ndarray:
         quats = []
         for i in range(len(positions)):
-            tan = tangents[i]
-            if np.linalg.norm(tan) < 1e-6: tan = np.array([0.0, 0.0, 1.0])
-            forward = tan / (np.linalg.norm(tan) + 1e-9)
-            up = np.array([0.0, 1.0, 0.0])
-            if abs(np.dot(forward, up)) > 0.95: up = np.array([1.0, 0.0, 0.0])
-            right = np.cross(up, forward)
-            right /= (np.linalg.norm(right) + 1e-9)
-            up_corrected = np.cross(forward, right)
-            rot_mat = np.stack([right, up_corrected, -forward], axis=1)
-            if np.linalg.det(rot_mat) < 0: rot_mat[:, 0] *= -1
-            q = R.from_matrix(rot_mat).as_quat()
-            quats.append(q)
-        quats = np.array(quats)
-        smoothed_quats = [quats[0]]
-        alpha = 0.05 
-        curr_rot = R.from_quat(quats[0])
+            t = tangents[i]
+            norm = np.linalg.norm(t)
+            if norm < 1e-6: t = np.array([0, 0, 1])
+            else: t = t / norm
+            
+            # Look forward
+            # Up vector assumption: Y is up
+            right = np.cross(np.array([0, 1, 0]), t)
+            if np.linalg.norm(right) < 0.01: # looking straight up/down
+                right = np.array([1, 0, 0])
+            right /= np.linalg.norm(right)
+            
+            up = np.cross(t, right)
+            
+            # Construct rotation matrix [right, up, -forward] (OpenGL style view)
+            # But here we need Camera-to-World. 
+            # In computer graphics, camera looks down -Z. 
+            # So Forward = -Z_cam => Z_cam = -Forward
+            rot_mat = np.stack([right, up, -t], axis=1)
+            
+            r = R.from_matrix(rot_mat)
+            quats.append(r.as_quat())
+            
+        # Smooth rotations
+        slerp_quats = [quats[0]]
         for i in range(1, len(quats)):
-            target_rot = R.from_quat(quats[i])
-            key_rots = R.from_quat(np.stack([curr_rot.as_quat(), target_rot.as_quat()]))
-            slerp = Slerp([0, 1], key_rots)
-            curr_rot = slerp([alpha])[0]
-            smoothed_quats.append(curr_rot.as_quat())
-        return np.array(smoothed_quats)
+            prev = R.from_quat(slerp_quats[-1])
+            curr = R.from_quat(quats[i])
+            
+            # Simple exp smoothing or SLERP
+            key_times = [0, 1]
+            key_rots = R.from_quat([prev.as_quat(), curr.as_quat()])
+            interpolator = Slerp(key_times, key_rots)
+            slerp_quats.append(interpolator([0.1])[0].as_quat())
+            
+        return np.array(slerp_quats)
 
     def _look_at(self, position, target):
         forward = target - position
-        if np.linalg.norm(forward) < 1e-6: forward = np.array([0.0, 0.0, 1.0])
-        forward /= np.linalg.norm(forward)
-        up = np.array([0.0, 1.0, 0.0])
-        if abs(np.dot(forward, up)) > 0.95: up = np.array([1.0, 0.0, 0.0])
-        right = np.cross(up, forward)
-        right /= np.linalg.norm(right) + 1e-9
-        up_corrected = np.cross(forward, right)
-        rot = np.stack([right, up_corrected, -forward], axis=1)
-        if np.linalg.det(rot) < 0: rot[:, 0] *= -1
-        return R.from_matrix(rot).as_quat()
+        return R.from_matrix(self._build_lookat_matrix(forward)).as_quat()
 
-    def _look_forward(self, forward):
-        forward = forward / (np.linalg.norm(forward) + 1e-9)
-        up = np.array([0.0, 1.0, 0.0])
-        if abs(np.dot(forward, up)) > 0.95: up = np.array([1.0, 0.0, 0.0])
-        right = np.cross(up, forward)
-        right /= np.linalg.norm(right) + 1e-9
-        up_corrected = np.cross(forward, right)
-        rot = np.stack([right, up_corrected, -forward], axis=1)
-        if np.linalg.det(rot) < 0: rot[:, 0] *= -1
-        return R.from_matrix(rot).as_quat()
-
-    @staticmethod
-    def _euclidean(a, b):
-        return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+    def _build_lookat_matrix(self, forward):
+        forward = forward / (np.linalg.norm(forward) + 1e-6)
+        right = np.cross(np.array([0, 1, 0]), forward)
+        if np.linalg.norm(right) < 0.01: right = np.array([1, 0, 0])
+        right /= np.linalg.norm(right)
+        up = np.cross(forward, right)
+        return np.stack([right, up, -forward], axis=1)
