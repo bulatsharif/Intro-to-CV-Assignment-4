@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -84,9 +85,9 @@ class Renderer:
                     self.backend_available = True
                 else:
                     print(
-                        "gsplat found but no known render function; rendering disabled. "
-                        "Known entrypoints: gsplat.render, gsplat.rendering.render, gsplat.rendering.forward, "
-                        "gsplat.rendering.render_cuda"
+                        "gsplat found but no known render function; rendering disabled.\n"
+                        "Expected entrypoints include: gsplat.rendering.rasterization (v1.5+), "
+                        "gsplat.render, gsplat.rendering.render/forward/render_cuda."
                     )
             except ImportError:
                 print("gsplat not available; falling back to dry-run.")
@@ -120,39 +121,37 @@ class Renderer:
         bg = torch.zeros(3, device=self.device, dtype=torch.float32)
         if background is not None:
             bg = torch.tensor(background, device=self.device, dtype=torch.float32)
+        bg = bg.to(self.device).float()
 
+        colors, sh_degree = self._prepare_colors(gaussians)
         for idx, pose in enumerate(trajectory.poses):
             view = self._pose_to_w2c(pose)
             view_t = torch.tensor(view, device=self.device, dtype=torch.float32)
             try:
-                image = self._render_fn(
-                    means3d=gaussians["means"],
+                image, _, _ = self._render_fn(
+                    means=gaussians["means"],
+                    quats=gaussians["rots"],
                     scales=gaussians["scales"],
-                    rotations=gaussians["rots"],
                     opacities=gaussians["opacity"],
-                    shs=gaussians.get("shs"),
-                    colors_precomp=None,
-                    cov3d_precomp=None,
+                    colors=colors,
                     viewmats=view_t[None, ...],
                     Ks=K[None, ...],
                     width=self.width,
                     height=self.height,
+                    sh_degree=sh_degree,
                     packed=False,
-                    background=bg,
+                    backgrounds=bg[None, ...],
                 )
             except Exception as e:
                 raise RuntimeError(f"gsplat render failed at frame {idx}: {e}") from e
 
-            # gsplat may return either tensor or tuple; handle both.
-            if isinstance(image, (list, tuple)):
-                image = image[0]
-            img_np = (
-                image.clamp(0, 1)
-                .permute(1, 2, 0)
-                .detach()
-                .cpu()
-                .numpy()
-            )
+            # rasterization returns (..., C, H, W, 3); drop batch/camera dims.
+            if image.ndim == 5:
+                img_np = image[0, 0].clamp(0, 1).detach().cpu().numpy()
+            elif image.ndim == 4:
+                img_np = image[0].clamp(0, 1).detach().cpu().numpy()
+            else:
+                img_np = image.clamp(0, 1).detach().cpu().numpy()
             self._write_frame(frames_dir, idx, img_np)
         return frames_dir
 
@@ -204,22 +203,41 @@ class Renderer:
 
         return {"means": means, "opacity": opacity, "scales": scales, "rots": rots, "shs": shs}
 
+    def _prepare_colors(self, gaussians: Dict[str, Any]):
+        torch = self.torch  # type: ignore
+        assert torch is not None
+        shs = gaussians.get("shs")
+        if shs is None:
+            # fallback: use opaque white
+            colors = torch.ones((gaussians["means"].shape[0], 1, 3), device=self.device, dtype=torch.float32)
+            return colors, None
+
+        # shs shape: (N, F). Convert to (N, K, 3)
+        N, F = shs.shape
+        if F % 3 != 0:
+            raise ValueError(f"Unexpected SH layout: {F} not divisible by 3")
+        K = F // 3
+        sh_degree = int(round(math.sqrt(K) - 1))
+        if (sh_degree + 1) ** 2 != K:
+            raise ValueError(f"Cannot infer SH degree from {K} coefficients.")
+        colors = shs.view(N, K, 3)
+        return colors, sh_degree
+
     def _resolve_render_fn(self, gsplat_mod: Any):
         """
         Handle gsplat API differences across releases.
         Tries a handful of known entrypoints and returns the first callable found.
         """
-        candidates = [
-            ("render", None),
-            ("rendering", "render"),
-            ("rendering", "forward"),
-            ("rendering", "render_cuda"),
-        ]
-        for mod_attr, fn_attr in candidates:
-            target = getattr(gsplat_mod, mod_attr, None)
-            if target is None:
-                continue
-            fn = getattr(target, fn_attr, None) if fn_attr else target
+        # Prefer documented rasterization entrypoint (gsplat>=1.5)
+        if hasattr(gsplat_mod, "rendering"):
+            rendering = gsplat_mod.rendering
+            for name in ("rasterization", "render", "forward", "render_cuda"):
+                fn = getattr(rendering, name, None)
+                if callable(fn):
+                    return fn
+        # Older/alternate layout
+        for name in ("render",):
+            fn = getattr(gsplat_mod, name, None)
             if callable(fn):
                 return fn
         return None
