@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 from plyfile import PlyData
@@ -60,6 +60,7 @@ class Renderer:
         height: int = 800,
         backend: str = "none",
         device: str = "cuda",
+        rng_seed: int = 0,
     ) -> None:
         self.ply_path = ply_path
         self.output_dir = output_dir
@@ -67,6 +68,7 @@ class Renderer:
         self.height = height
         self.backend = backend
         self.device = device
+        self.rng_seed = rng_seed
         self.backend_available = False
 
         self.torch = None
@@ -101,6 +103,10 @@ class Renderer:
         cx: Optional[float] = None,
         cy: Optional[float] = None,
         background: Optional[np.ndarray] = None,
+        max_points: Optional[int] = None,
+        tile_size: int = 16,
+        render_mode: str = "RGB",
+        packed: bool = True,
     ) -> Optional[Path]:
         frames_dir = self.output_dir / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +117,7 @@ class Renderer:
 
         torch = self.torch  # type: ignore
         assert torch is not None and self._render_fn is not None
-        gaussians = self._load_gaussians()
+        gaussians = self._load_gaussians(max_points=max_points)
         fx = fx or float(self.width / 2)
         fy = fy or float(self.height / 2)
         cx = cx or float(self.width / 2)
@@ -139,8 +145,10 @@ class Renderer:
                     width=self.width,
                     height=self.height,
                     sh_degree=sh_degree,
-                    packed=False,
+                    packed=packed,
                     backgrounds=bg[None, ...],
+                    tile_size=tile_size,
+                    render_mode=render_mode,
                 )
             except Exception as e:
                 raise RuntimeError(f"gsplat render failed at frame {idx}: {e}") from e
@@ -156,7 +164,7 @@ class Renderer:
         return frames_dir
 
     # ------------------------------------------------------------------ #
-    def _load_gaussians(self) -> Dict[str, Any]:
+    def _load_gaussians(self, max_points: Optional[int] = None) -> Dict[str, Any]:
         ply = PlyData.read(self.ply_path)
         v = ply["vertex"].data
         torch = self.torch  # type: ignore
@@ -168,40 +176,56 @@ class Renderer:
                 raise KeyError(f"PLY missing required field '{field}' for rendering")
             return v[field]
 
-        means = torch.tensor(
-            np.stack([need("x"), need("y"), need("z")], axis=-1),
-            device=self.device,
-            dtype=torch.float32,
+        coords = np.stack([need("x"), need("y"), need("z")], axis=-1)
+        opacity_np = np.clip(v["opacity"], 0.0, 1.0) if "opacity" in names else np.ones(len(v), dtype=np.float32)
+        scales_np = (
+            np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1)
+            if {"scale_0", "scale_1", "scale_2"} <= names
+            else np.ones((len(v), 3), dtype=np.float32)
         )
-        if "opacity" in names:
-            opacity_np = np.clip(v["opacity"], 0.0, 1.0)
-        else:
-            opacity_np = np.ones(len(v), dtype=np.float32)
-        opacity = torch.tensor(opacity_np, device=self.device, dtype=torch.float32)
-
-        if {"scale_0", "scale_1", "scale_2"} <= names:
-            scales_np = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1)
-        else:
-            scales_np = np.ones((len(v), 3), dtype=np.float32)
-        scales = torch.tensor(scales_np, device=self.device, dtype=torch.float32)
-
-        if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names:
-            rots_np = np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=-1)
-        else:
-            rots_np = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (len(v), 1))
-        rots = torch.tensor(rots_np, device=self.device, dtype=torch.float32)
+        rots_np = (
+            np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=-1)
+            if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names
+            else np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (len(v), 1))
+        )
 
         # SH coefficients (f_dc_*, f_rest_*)
         sh_fields = [name for name in names if name.startswith("f_dc") or name.startswith("f_rest")]
         shs = None
         if sh_fields:
-            shs = torch.tensor(
-                np.stack([v[field] for field in sh_fields], axis=-1),
-                device=self.device,
-                dtype=torch.float32,
-            )
+            shs = np.stack([v[field] for field in sh_fields], axis=-1)
 
-        return {"means": means, "opacity": opacity, "scales": scales, "rots": rots, "shs": shs}
+        coords, opacity_np, scales_np, rots_np, shs = self._maybe_subsample(
+            coords, opacity_np, scales_np, rots_np, shs, max_points
+        )
+
+        means = torch.tensor(coords, device=self.device, dtype=torch.float32)
+        opacity = torch.tensor(opacity_np, device=self.device, dtype=torch.float32)
+        scales = torch.tensor(scales_np, device=self.device, dtype=torch.float32)
+        rots = torch.tensor(rots_np, device=self.device, dtype=torch.float32)
+        shs_t = torch.tensor(shs, device=self.device, dtype=torch.float32) if shs is not None else None
+
+        return {"means": means, "opacity": opacity, "scales": scales, "rots": rots, "shs": shs_t}
+
+    def _maybe_subsample(
+        self,
+        coords: np.ndarray,
+        opacities: np.ndarray,
+        scales: np.ndarray,
+        rots: np.ndarray,
+        shs: Optional[np.ndarray],
+        max_points: Optional[int],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        if max_points is None or coords.shape[0] <= max_points:
+            return coords, opacities, scales, rots, shs
+        rng = np.random.default_rng(self.rng_seed)
+        idx = rng.choice(coords.shape[0], size=max_points, replace=False)
+        coords = coords[idx]
+        opacities = opacities[idx]
+        scales = scales[idx]
+        rots = rots[idx]
+        shs = shs[idx] if shs is not None else None
+        return coords, opacities, scales, rots, shs
 
     def _prepare_colors(self, gaussians: Dict[str, Any]):
         torch = self.torch  # type: ignore

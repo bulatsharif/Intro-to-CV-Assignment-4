@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=800, help="Render width")
     parser.add_argument("--height", type=int, default=800, help="Render height")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device for rendering")
+    parser.add_argument("--max_points", type=int, default=None, help="Subsample gaussians to this many points to save GPU memory")
+    parser.add_argument("--tile_size", type=int, default=16, help="gsplat tile_size (higher = faster, more memory)")
+    parser.add_argument("--render_mode", type=str, default="RGB", help="gsplat render_mode (RGB, D, ED, RGB+D, RGB+ED)")
+    parser.add_argument("--packed", dest="packed", action="store_true", help="Use packed rendering (lower memory, default)")
+    parser.add_argument("--unpacked", dest="packed", action="store_false", help="Use unpacked rendering (faster, more memory)")
+    parser.set_defaults(packed=True)
     parser.add_argument("--video", action="store_true", help="Assemble rendered frames into an mp4")
     parser.add_argument("--fps", type=int, default=30, help="FPS for video assembly")
     return parser.parse_args()
@@ -62,7 +68,13 @@ def main() -> None:
             backend=args.render_backend,
             device=args.device,
         )
-        frames_dir = renderer.render_trajectory(trajectory)
+        frames_dir = renderer.render_trajectory(
+            trajectory,
+            max_points=args.max_points,
+            tile_size=args.tile_size,
+            render_mode=args.render_mode,
+            packed=args.packed,
+        )
 
     if args.video:
         frames_base = frames_dir if frames_dir is not None else output_dir / "frames"
