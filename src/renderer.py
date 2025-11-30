@@ -180,17 +180,35 @@ class Renderer:
             return v[field]
 
         coords = np.stack([need("x"), need("y"), need("z")], axis=-1)
-        opacity_np = np.clip(v["opacity"], 0.0, 1.0) if "opacity" in names else np.ones(len(v), dtype=np.float32)
-        scales_np = (
-            np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1)
-            if {"scale_0", "scale_1", "scale_2"} <= names
-            else np.ones((len(v), 3), dtype=np.float32)
-        )
+        
+        # --- FIX 1: OPACITY ACTIVATION (Sigmoid) ---
+        if "opacity" in names:
+            op_raw = v["opacity"]
+            # Heuristic: if values are outside [0,1], they are logits
+            if op_raw.min() < 0 or op_raw.max() > 1:
+                opacity_np = 1 / (1 + np.exp(-op_raw))
+            else:
+                opacity_np = np.clip(op_raw, 0.0, 1.0)
+        else:
+            opacity_np = np.ones(len(v), dtype=np.float32)
+
+        # --- FIX 2: SCALE ACTIVATION (Exp) ---
+        if {"scale_0", "scale_1", "scale_2"} <= names:
+            scales_raw = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1)
+            # Standard 3DGS stores log-scales. Apply exp() to get actual size.
+            scales_np = np.exp(scales_raw)
+        else:
+            # Fallback default size
+            scales_np = np.ones((len(v), 3), dtype=np.float32) * 0.01
+
         rots_np = (
             np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=-1)
             if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names
-            else np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (len(v), 1))
+            else np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (len(v), 1))
         )
+        # Normalize quaternions just in case
+        rots_norm = np.linalg.norm(rots_np, axis=-1, keepdims=True)
+        rots_np = rots_np / (rots_norm + 1e-9)
 
         # SH coefficients (f_dc_*, f_rest_*)
         sh_fields = [name for name in names if name.startswith("f_dc") or name.startswith("f_rest")]
