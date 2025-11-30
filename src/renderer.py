@@ -133,6 +133,9 @@ class Renderer:
         backgrounds = bg if packed else bg.view(1, 1, -1)
 
         colors, sh_degree = self._prepare_colors(gaussians)
+        
+        print(f"[Renderer] Starting render of {len(trajectory.poses)} frames...")
+        
         for idx, pose in enumerate(trajectory.poses):
             view = self._pose_to_w2c(pose)
             view_t = torch.tensor(view, device=self.device, dtype=torch.float32)
@@ -181,10 +184,11 @@ class Renderer:
 
         coords = np.stack([need("x"), need("y"), need("z")], axis=-1)
         
-        # --- FIX 1: OPACITY ACTIVATION (Sigmoid) ---
+        # --- ACTIVATION FIX: Opacity (Sigmoid) ---
         if "opacity" in names:
             op_raw = v["opacity"]
-            # Heuristic: if values are outside [0,1], they are logits
+            # Heuristic: standard 3DGS stores logits (negative/positive floats). 
+            # If values are outside [0,1], we assume logits.
             if op_raw.min() < 0 or op_raw.max() > 1:
                 opacity_np = 1 / (1 + np.exp(-op_raw))
             else:
@@ -192,13 +196,12 @@ class Renderer:
         else:
             opacity_np = np.ones(len(v), dtype=np.float32)
 
-        # --- FIX 2: SCALE ACTIVATION (Exp) ---
+        # --- ACTIVATION FIX: Scale (Exp) ---
         if {"scale_0", "scale_1", "scale_2"} <= names:
             scales_raw = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1)
-            # Standard 3DGS stores log-scales. Apply exp() to get actual size.
+            # Standard 3DGS stores log-scales. We must apply exp() to get physical size.
             scales_np = np.exp(scales_raw)
         else:
-            # Fallback default size
             scales_np = np.ones((len(v), 3), dtype=np.float32) * 0.01
 
         rots_np = (
@@ -206,7 +209,8 @@ class Renderer:
             if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names
             else np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (len(v), 1))
         )
-        # Normalize quaternions just in case
+        
+        # Normalize quaternions (crucial for valid rendering)
         rots_norm = np.linalg.norm(rots_np, axis=-1, keepdims=True)
         rots_np = rots_np / (rots_norm + 1e-9)
 
@@ -264,7 +268,11 @@ class Renderer:
         K = F // 3
         sh_degree = int(round(math.sqrt(K) - 1))
         if (sh_degree + 1) ** 2 != K:
-            raise ValueError(f"Cannot infer SH degree from {K} coefficients.")
+            # Fallback for weird SH counts, treat as Degree 0 (Diffuse)
+            print(f"[Warning] SH count {F} doesn't map to a standard degree. Truncating to Degree 0.")
+            colors = shs[:, :3].view(N, 1, 3)
+            return colors, 0
+            
         colors = shs.view(N, K, 3)
         return colors, sh_degree
 
