@@ -129,6 +129,9 @@ class Renderer:
             bg = torch.tensor(background, device=self.device, dtype=torch.float32)
         bg = bg.to(self.device).float()
 
+        # backgrounds shape must match image_dims + (channels,)
+        backgrounds = bg if packed else bg.view(1, 1, -1)
+
         colors, sh_degree = self._prepare_colors(gaussians)
         for idx, pose in enumerate(trajectory.poses):
             view = self._pose_to_w2c(pose)
@@ -146,7 +149,7 @@ class Renderer:
                     height=self.height,
                     sh_degree=sh_degree,
                     packed=packed,
-                    backgrounds=bg[None, ...],
+                    backgrounds=backgrounds,
                     tile_size=tile_size,
                     render_mode=render_mode,
                 )
@@ -233,7 +236,7 @@ class Renderer:
         shs = gaussians.get("shs")
         if shs is None:
             # fallback: use opaque white
-            colors = torch.ones((gaussians["means"].shape[0], 1, 3), device=self.device, dtype=torch.float32)
+            colors = torch.ones((gaussians["means"].shape[0], 3), device=self.device, dtype=torch.float32)
             return colors, None
 
         # shs shape: (N, F). Convert to (N, K, 3)
