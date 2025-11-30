@@ -47,11 +47,6 @@ def assemble_video(frames_dir: Path, output_path: Path, fps: int = 30) -> None:
 
 
 class Renderer:
-    """
-    Thin wrapper around gsplat/diff-gaussian-rasterization. Defaults to a dry-run
-    that only stores the camera path so development on CPU-only machines remains possible.
-    """
-
     def __init__(
         self,
         ply_path: str,
@@ -129,12 +124,11 @@ class Renderer:
             bg = torch.tensor(background, device=self.device, dtype=torch.float32)
         bg = bg.to(self.device).float()
 
-        # backgrounds shape must match image_dims + (channels,)
         backgrounds = bg if packed else bg.view(1, 1, -1)
 
         colors, sh_degree = self._prepare_colors(gaussians)
         
-        print(f"[Renderer] Starting render of {len(trajectory.poses)} frames...")
+        print(f"[Renderer] Render Config: {self.width}x{self.height}, SH Degree: {sh_degree}")
         
         for idx, pose in enumerate(trajectory.poses):
             view = self._pose_to_w2c(pose)
@@ -171,25 +165,29 @@ class Renderer:
 
     # ------------------------------------------------------------------ #
     def _load_gaussians(self, max_points: Optional[int] = None) -> Dict[str, Any]:
+        print(f"[Loader] Reading PLY: {self.ply_path}")
         ply = PlyData.read(self.ply_path)
         v = ply["vertex"].data
         torch = self.torch  # type: ignore
         assert torch is not None
-        names = set(v.dtype.names or [])
+        
+        # FIX: Use tuple (ordered) not set (unordered)
+        all_names = v.dtype.names or []
+        names_set = set(all_names)
 
         def need(field: str) -> np.ndarray:
-            if field not in names:
+            if field not in names_set:
                 raise KeyError(f"PLY missing required field '{field}' for rendering")
             return v[field]
 
         coords = np.stack([need("x"), need("y"), need("z")], axis=-1)
         
         # --- ACTIVATION FIX: Opacity (Sigmoid) ---
-        if "opacity" in names:
+        if "opacity" in names_set:
             op_raw = v["opacity"]
-            # Heuristic: standard 3DGS stores logits (negative/positive floats). 
-            # If values are outside [0,1], we assume logits.
+            print(f"[Loader] Raw Opacity Range: Min={op_raw.min():.2f}, Max={op_raw.max():.2f}")
             if op_raw.min() < 0 or op_raw.max() > 1:
+                print("[Loader] Applying Sigmoid to Opacity (Logits detected)")
                 opacity_np = 1 / (1 + np.exp(-op_raw))
             else:
                 opacity_np = np.clip(op_raw, 0.0, 1.0)
@@ -197,27 +195,32 @@ class Renderer:
             opacity_np = np.ones(len(v), dtype=np.float32)
 
         # --- ACTIVATION FIX: Scale (Exp) ---
-        if {"scale_0", "scale_1", "scale_2"} <= names:
+        if {"scale_0", "scale_1", "scale_2"} <= names_set:
             scales_raw = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1)
-            # Standard 3DGS stores log-scales. We must apply exp() to get physical size.
-            scales_np = np.exp(scales_raw)
+            print(f"[Loader] Raw Scale Range: Min={scales_raw.min():.2f}, Max={scales_raw.max():.2f}")
+            # Heuristic: If scales are negative, they are Log-Scales.
+            if scales_raw.max() < 0 or scales_raw.mean() < 0.1:
+                print("[Loader] Applying Exp to Scales (Log-scales detected)")
+                scales_np = np.exp(scales_raw)
+            else:
+                scales_np = scales_raw
         else:
             scales_np = np.ones((len(v), 3), dtype=np.float32) * 0.01
 
         rots_np = (
             np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=-1)
-            if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names
+            if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names_set
             else np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (len(v), 1))
         )
         
-        # Normalize quaternions (crucial for valid rendering)
         rots_norm = np.linalg.norm(rots_np, axis=-1, keepdims=True)
         rots_np = rots_np / (rots_norm + 1e-9)
 
-        # SH coefficients (f_dc_*, f_rest_*)
-        sh_fields = [name for name in names if name.startswith("f_dc") or name.startswith("f_rest")]
+        # FIX: Load SH coefficients IN ORDER using the ordered `all_names` list
+        sh_fields = [name for name in all_names if name.startswith("f_dc") or name.startswith("f_rest")]
         shs = None
         if sh_fields:
+            print(f"[Loader] Found {len(sh_fields)} SH coefficient fields.")
             shs = np.stack([v[field] for field in sh_fields], axis=-1)
 
         coords, opacity_np, scales_np, rots_np, shs = self._maybe_subsample(
@@ -243,6 +246,7 @@ class Renderer:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
         if max_points is None or coords.shape[0] <= max_points:
             return coords, opacities, scales, rots, shs
+        print(f"[Loader] Subsampling from {coords.shape[0]} to {max_points} points.")
         rng = np.random.default_rng(self.rng_seed)
         idx = rng.choice(coords.shape[0], size=max_points, replace=False)
         coords = coords[idx]
@@ -267,28 +271,25 @@ class Renderer:
             raise ValueError(f"Unexpected SH layout: {F} not divisible by 3")
         K = F // 3
         sh_degree = int(round(math.sqrt(K) - 1))
+        
         if (sh_degree + 1) ** 2 != K:
-            # Fallback for weird SH counts, treat as Degree 0 (Diffuse)
-            print(f"[Warning] SH count {F} doesn't map to a standard degree. Truncating to Degree 0.")
-            colors = shs[:, :3].view(N, 1, 3)
-            return colors, 0
+            # Fallback for unexpected SH counts (like degree 0 only)
+            if F == 3: 
+                sh_degree = 0
+            else:
+                 print(f"[Warning] SH count {F} implies non-standard degree. Using degree 0.")
+                 sh_degree = 0
             
         colors = shs.view(N, K, 3)
         return colors, sh_degree
 
     def _resolve_render_fn(self, gsplat_mod: Any):
-        """
-        Handle gsplat API differences across releases.
-        Tries a handful of known entrypoints and returns the first callable found.
-        """
-        # Prefer documented rasterization entrypoint (gsplat>=1.5)
         if hasattr(gsplat_mod, "rendering"):
             rendering = gsplat_mod.rendering
             for name in ("rasterization", "render", "forward", "render_cuda"):
                 fn = getattr(rendering, name, None)
                 if callable(fn):
                     return fn
-        # Older/alternate layout
         for name in ("render",):
             fn = getattr(gsplat_mod, name, None)
             if callable(fn):
