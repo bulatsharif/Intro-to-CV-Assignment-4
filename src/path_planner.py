@@ -9,7 +9,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R, Slerp
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, binary_dilation, generate_binary_structure, label
 
 from scene_map import SceneMap
 
@@ -39,61 +39,171 @@ class PathPlanner:
     def __init__(self, scene: SceneMap) -> None:
         self.scene = scene
         self.cost_map: Optional[np.ndarray] = None
-        self.ceiling_height_idx: int = 0
-        self.floor_height_idx: int = 0
+        self.interior_mask: Optional[np.ndarray] = None # <--- NEW: strict bounds
 
     def plan(self, num_frames: int = 600) -> Trajectory:
         assert self.scene.bounds is not None
         
-        # 1. Analyze Vertical Limits (The Lid and the Floor)
-        if self.scene.filtered_points is not None:
-            # We treat the top 10% of points as the "Roof" and bottom 5% as "Foundation"
-            y_coords = self.scene.filtered_points[:, 1]
-            roof_y = np.percentile(y_coords, 90)
-            floor_y = np.percentile(y_coords, 5)
-            
-            # Convert to grid indices
-            _, self.ceiling_height_idx, _ = self.scene.world_to_grid(np.array([0, roof_y, 0]))
-            _, self.floor_height_idx, _ = self.scene.world_to_grid(np.array([0, floor_y, 0]))
-            print(f"[Planner] Vertical Clamp Active: Grid Y {self.floor_height_idx} to {self.ceiling_height_idx}")
-        
-        # 2. Build Cost Map
-        self._build_cost_map()
-        
+        # Heuristic check
         if self.scene.bounds.max_dimension < 10.0:
+            print("[Planner] Small scene detected. Using Orbit.")
             return self.plan_orbit(num_frames=num_frames)
-        return self.plan_explorer(num_frames=num_frames)
 
-    def _build_cost_map(self):
+        print("[Planner] Large scene detected. Using Sealed Explorer.")
+        return self.plan_sealed_explorer(num_frames=num_frames)
+
+    def plan_sealed_explorer(self, num_frames: int = 600) -> Trajectory:
         assert self.scene.grid_shape is not None
-        shape = self.scene.grid_shape
         
-        grid = np.zeros(shape, dtype=bool)
+        # 1. Find Safe Start (Sandwich Method)
+        center_x, center_z = self.scene.get_center_grid()[0], self.scene.get_center_grid()[2]
+        start_idx = self._find_vertical_sandwich_start(center_x, center_z)
+        print(f"[Planner] Sandwich Start: {start_idx}")
+
+        # 2. Build The "Sealed" Map (Caulk the windows)
+        print("[Planner] Sealing building leaks (Morphological Dilation)...")
+        self._build_topology_mask(seed_point=start_idx)
+        
+        # 3. Find Key Points (Strictly Inside)
+        print("[Planner] Finding Point A (Interior)...")
+        a_idx, _ = self._bfs_interior(start_idx)
+        print(f"[Planner] Point A: {a_idx}. Finding Point B...")
+        b_idx, _ = self._bfs_interior(a_idx)
+        print(f"[Planner] Point B: {b_idx}.")
+
+        # 4. Pathfinding
+        print(f"[Planner] Running Sealed-A*...")
+        path_grid = self._astar_sealed(a_idx, b_idx)
+        print(f"[Planner] Path Length: {len(path_grid)}")
+
+        # Fallback if A* fails
+        if len(path_grid) < 5:
+            path_grid = self._astar_sealed(start_idx, a_idx)
+            if len(path_grid) < 5:
+                 # Last resort: hover
+                 pos = self.scene.grid_to_world(start_idx)
+                 quat = self._look_forward(np.array([0, 0, 1], dtype=float))
+                 return Trajectory(poses=[CameraPose(position=pos, rotation=quat)]*num_frames, mode="explorer")
+
+        # 5. Smooth & Convert
+        path_world = np.stack([self.scene.grid_to_world(p) for p in path_grid], axis=0)
+        
+        subsample_step = max(1, len(path_world) // 15)
+        control_points = path_world[::subsample_step]
+        if not np.array_equal(control_points[-1], path_world[-1]):
+            control_points = np.vstack([control_points, path_world[-1]])
+
+        smooth_pos, tangents = self._smooth_path(control_points, num_frames=num_frames)
+        quats = self._orientations_from_tangents(smooth_pos, tangents)
+        
+        poses = [CameraPose(position=pos, rotation=quat) for pos, quat in zip(smooth_pos, quats)]
+        return Trajectory(poses=poses, mode="explorer")
+
+    def _build_topology_mask(self, seed_point: Tuple[int, int, int]):
+        """
+        Creates a 'Strict Interior' mask by thickening walls and finding the 
+        connected component belonging to the seed point.
+        """
+        shape = self.scene.grid_shape
+        # 1. Base Obstacles
+        obstacles = np.zeros(shape, dtype=bool)
         for (x, y, z) in self.scene.occupied_voxels:
             if 0 <= x < shape[0] and 0 <= y < shape[1] and 0 <= z < shape[2]:
-                grid[x, y, z] = 1
+                obstacles[x, y, z] = 1
         
-        # Pad Edges
-        grid[0:2, :, :] = 1; grid[-2:, :, :] = 1
-        grid[:, 0:2, :] = 1; grid[:, -2:, :] = 1
-        grid[:, :, 0:2] = 1; grid[:, :, -2:] = 1
+        # 2. Thicken Walls (Seal gaps < 1.5m)
+        # 3 iterations of dilation = 1.5 meters of thickness added
+        struct = generate_binary_structure(3, 1) # 6-connectivity
+        thick_walls = binary_dilation(obstacles, structure=struct, iterations=3)
         
-        # Compute Distance Field
-        dist_field = distance_transform_edt(1 - grid.astype(int))
-        self.cost_map = 1.0 + (10.0 / (dist_field + 0.5)) # Stronger central bias
-        self.cost_map[grid == 1] = float('inf')
+        # 3. Define Free Space (Inverse of thick walls)
+        free_space = ~thick_walls
         
-        # --- NEW: Vertical Clamp (Hard Limit) ---
-        # Mark everything above ceiling and below floor as Obstacle
-        if self.ceiling_height_idx > 0:
-            self.cost_map[:, self.ceiling_height_idx:, :] = float('inf')
-        if self.floor_height_idx > 0:
-            self.cost_map[:, :self.floor_height_idx, :] = float('inf')
+        # Ensure start point isn't accidentally walled off by the thickening
+        # If it is, clear a small bubble around it
+        sx, sy, sz = seed_point
+        if not free_space[sx, sy, sz]:
+            print("[Planner] Warning: Start point covered by thick walls. Carving bubble.")
+            r = 2
+            x_min, x_max = max(0, sx-r), min(shape[0], sx+r+1)
+            y_min, y_max = max(0, sy-r), min(shape[1], sy+r+1)
+            z_min, z_max = max(0, sz-r), min(shape[2], sz+r+1)
+            free_space[x_min:x_max, y_min:y_max, z_min:z_max] = 1
+            obstacles[x_min:x_max, y_min:y_max, z_min:z_max] = 0 # Also clear from cost map base
+            
+        # 4. Connected Components (Labeling)
+        labeled_array, num_features = label(free_space, structure=struct)
+        
+        # 5. Select the component containing the seed
+        seed_label = labeled_array[sx, sy, sz]
+        if seed_label == 0:
+            raise RuntimeError("Start point is in void after clearing? Should not happen.")
+            
+        self.interior_mask = (labeled_array == seed_label)
+        vol_voxels = np.sum(self.interior_mask)
+        print(f"[Planner] Interior Volume Defined: {vol_voxels} voxels.")
 
-        print("[Planner] Cost Map Built with Vertical Clamping.")
+        # 6. Build Cost Map (Restricted to this mask)
+        # Use original obstacles for distance field (precision), but cap with mask
+        dist_field = distance_transform_edt(1 - obstacles.astype(int))
+        self.cost_map = 1.0 + (8.0 / (dist_field + 0.5))
+        
+        # Apply the Mask: Infinite cost everywhere outside the bubble
+        self.cost_map[~self.interior_mask] = float('inf')
 
-    def plan_orbit(self, num_frames: int = 600) -> Trajectory:
-        # (Same Orbit logic as before - omitted for brevity, keeping existing code logic is fine)
+    def _astar_sealed(self, start: Tuple[int, int, int], goal: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
+        open_heap: List[Tuple[float, float, Tuple[int, int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start))
+        came_from: dict = {}
+        g_score = {start: 0.0}
+
+        while open_heap:
+            _, g_curr, current = heapq.heappop(open_heap)
+            if current == goal:
+                return self._reconstruct_path(came_from, current)
+
+            for nbr in self._neighbors(current):
+                nx, ny, nz = nbr
+                if not self._is_valid(nx, ny, nz): continue
+                
+                # Retrieve Cost (will be inf if outside mask)
+                step_cost = self.cost_map[nx, ny, nz] # type: ignore
+                if step_cost == float('inf'): continue
+
+                tentative_g = g_curr + step_cost
+                if tentative_g < g_score.get(nbr, float("inf")):
+                    came_from[nbr] = current
+                    g_score[nbr] = tentative_g
+                    f = tentative_g + self._euclidean(nbr, goal)
+                    heapq.heappush(open_heap, (f, tentative_g, nbr))
+        return [start]
+
+    def _bfs_interior(self, start: Tuple[int, int, int]) -> Tuple[Tuple[int, int, int], float]:
+        visited = {start}
+        q = deque([(start, 0)])
+        farthest = start
+        max_dist = 0
+        
+        while q:
+            node, dist = q.popleft()
+            if dist > max_dist:
+                max_dist = dist
+                farthest = node
+            
+            for nbr in self._neighbors(node):
+                if nbr in visited: continue
+                nx, ny, nz = nbr
+                if not self._is_valid(nx, ny, nz): continue
+                
+                # Strict Check: Must be in the Interior Mask
+                if not self.interior_mask[nx, ny, nz]: continue # type: ignore
+                
+                visited.add(nbr)
+                q.append((nbr, dist + 1))
+        return farthest, max_dist
+
+    # --- Boilerplate Helpers (Same as before) ---
+    def plan_orbit(self, num_frames=600) -> Trajectory:
         assert self.scene.bounds is not None
         assert self.scene.centroid is not None
         radius = max(self.scene.bounds.max_dimension * 0.9, self.scene.voxel_size * 5)
@@ -112,57 +222,10 @@ class PathPlanner:
             poses.append(CameraPose(position=pos, rotation=quat))
         return Trajectory(poses=poses, mode="orbit")
 
-    def plan_explorer(self, num_frames: int = 600) -> Trajectory:
-        # --- FIX: Vertical Sandwich Start ---
-        # Scan the center column to find the "Room Interior" gap
-        center_x, center_z = self.scene.get_center_grid()[0], self.scene.get_center_grid()[2]
-        start_idx = self._find_vertical_sandwich_start(center_x, center_z)
-        
-        print(f"[Planner] Sandwich Start Found at: {start_idx}")
-
-        # Find Key Points
-        print("[Planner] Finding Point A (Interior)...")
-        a_idx, _ = self._bfs_interior(start_idx)
-        print(f"[Planner] Point A: {a_idx}. Finding Point B...")
-        b_idx, _ = self._bfs_interior(a_idx)
-        print(f"[Planner] Point B: {b_idx}.")
-
-        # Pathfinding
-        print(f"[Planner] Running Interior-A* from {a_idx} to {b_idx}...")
-        path_grid = self._astar_interior(a_idx, b_idx)
-        print(f"[Planner] Path Length: {len(path_grid)}")
-
-        if len(path_grid) < 5:
-            # Fallback
-            path_grid = self._astar_interior(start_idx, a_idx)
-            if len(path_grid) < 5:
-                 pos = self.scene.grid_to_world(start_idx)
-                 quat = self._look_forward(np.array([0, 0, 1], dtype=float))
-                 return Trajectory(poses=[CameraPose(position=pos, rotation=quat)]*num_frames, mode="explorer")
-
-        # Smooth & Convert
-        path_world = np.stack([self.scene.grid_to_world(p) for p in path_grid], axis=0)
-        
-        # Subsample for smoothness
-        subsample_step = max(1, len(path_world) // 15)
-        control_points = path_world[::subsample_step]
-        if not np.array_equal(control_points[-1], path_world[-1]):
-            control_points = np.vstack([control_points, path_world[-1]])
-
-        smooth_pos, tangents = self._smooth_path(control_points, num_frames=num_frames)
-        quats = self._orientations_from_tangents(smooth_pos, tangents)
-        
-        poses = [CameraPose(position=pos, rotation=quat) for pos, quat in zip(smooth_pos, quats)]
-        return Trajectory(poses=poses, mode="explorer")
-
     def _find_vertical_sandwich_start(self, cx: int, cz: int) -> Tuple[int, int, int]:
-        """Scans Y column at (cx, cz). Finds biggest gap between solids."""
         gy = self.scene.grid_shape[1]
-        
-        # Collect spans of empty voxels
         current_span_start = -1
-        spans = [] # (start_y, length)
-        
+        spans = [] 
         for y in range(gy):
             is_solid = (cx, y, cz) in self.scene.occupied_voxels
             if not is_solid:
@@ -170,92 +233,14 @@ class PathPlanner:
             else:
                 if current_span_start != -1:
                     length = y - current_span_start
-                    # Filter tiny gaps (noise) and Huge gaps (likely outside/sky)
                     if length > 2 and length < (gy * 0.8): 
                         spans.append((current_span_start, length))
                     current_span_start = -1
-        
-        if not spans:
-            # Fallback: Just return center
-            return (cx, gy//2, cz)
-        
-        # Pick the largest span (likely the main hall)
+        if not spans: return (cx, gy//2, cz)
         spans.sort(key=lambda x: x[1], reverse=True)
         best_span = spans[0]
-        
-        # Start in the middle of that span
         start_y = best_span[0] + best_span[1] // 2
         return (cx, start_y, cz)
-
-    def _has_ceiling(self, idx: Tuple[int, int, int]) -> bool:
-        # Cast Ray UP. If we hit nothing before grid limit, we are outside.
-        x, y, z = idx
-        _, gy, _ = self.scene.grid_shape
-        
-        # Check 10 voxels above. If all empty, likely outside.
-        for h in range(1, 15): 
-            if y + h >= gy: return False # Hit sky limit
-            if (x, y+h, z) in self.scene.occupied_voxels:
-                return True # Hit ceiling
-        return False
-
-    def _bfs_interior(self, start: Tuple[int, int, int]) -> Tuple[Tuple[int, int, int], float]:
-        visited = {start}
-        q = deque([(start, 0)])
-        farthest = start
-        max_dist = 0
-        
-        while q:
-            node, dist = q.popleft()
-            if dist > max_dist:
-                max_dist = dist
-                farthest = node
-            
-            for nbr in self._neighbors(node):
-                if nbr in visited: continue
-                
-                # Check 1: Is it solid/expensive?
-                nx, ny, nz = nbr
-                if not self._is_valid(nx, ny, nz): continue
-                if self.cost_map[nx, ny, nz] > 1000: continue
-                
-                # Check 2: Does it have a ceiling? (Prevent leaking to roof)
-                # Optimization: Only check every few meters or if high up
-                if not self._has_ceiling(nbr): continue 
-                
-                visited.add(nbr)
-                q.append((nbr, dist + 1))
-        return farthest, max_dist
-
-    def _astar_interior(self, start: Tuple[int, int, int], goal: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
-        open_heap: List[Tuple[float, float, Tuple[int, int, int]]] = []
-        heapq.heappush(open_heap, (0.0, 0.0, start))
-        came_from: dict = {}
-        g_score = {start: 0.0}
-
-        while open_heap:
-            _, g_curr, current = heapq.heappop(open_heap)
-            if current == goal:
-                return self._reconstruct_path(came_from, current)
-
-            for nbr in self._neighbors(current):
-                nx, ny, nz = nbr
-                if not self._is_valid(nx, ny, nz): continue
-                step_cost = self.cost_map[nx, ny, nz] # type: ignore
-                
-                if step_cost > 1000: continue
-                
-                # Ceiling penalty: If no ceiling, add massive cost
-                if not self._has_ceiling(nbr):
-                     step_cost += 50.0 
-
-                tentative_g = g_curr + step_cost
-                if tentative_g < g_score.get(nbr, float("inf")):
-                    came_from[nbr] = current
-                    g_score[nbr] = tentative_g
-                    f = tentative_g + self._euclidean(nbr, goal)
-                    heapq.heappush(open_heap, (f, tentative_g, nbr))
-        return [start]
 
     def _is_valid(self, x, y, z):
         s = self.scene.grid_shape
@@ -283,19 +268,15 @@ class PathPlanner:
             interp = np.stack([np.interp(ts, t, points[:, dim]) for dim in range(3)], axis=-1)
             tangents = np.gradient(interp, axis=0)
             return interp, tangents
-
         distances = np.zeros(len(points))
         distances[1:] = np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))
         total_dist = distances[-1]
         for i in range(1, len(distances)):
             if distances[i] <= distances[i - 1]: distances[i] = distances[i - 1] + 1e-4
-                
         splines = [CubicSpline(distances, points[:, dim], bc_type="natural") for dim in range(3)]
-        
         lin_t = np.linspace(0, 1, num_frames)
-        smooth_t = 6*(lin_t**5) - 15*(lin_t**4) + 10*(lin_t**3) # Ease-in-out
+        smooth_t = 6*(lin_t**5) - 15*(lin_t**4) + 10*(lin_t**3)
         sample_dists = smooth_t * total_dist
-        
         interp = np.stack([s(sample_dists) for s in splines], axis=-1)
         tangents = np.stack([s(sample_dists, 1) for s in splines], axis=-1)
         return interp, tangents
@@ -315,7 +296,6 @@ class PathPlanner:
             if np.linalg.det(rot_mat) < 0: rot_mat[:, 0] *= -1
             q = R.from_matrix(rot_mat).as_quat()
             quats.append(q)
-
         quats = np.array(quats)
         smoothed_quats = [quats[0]]
         alpha = 0.05 
