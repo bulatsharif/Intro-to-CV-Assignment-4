@@ -4,7 +4,7 @@ import heapq
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -14,7 +14,6 @@ from scipy.ndimage import distance_transform_edt, binary_dilation, generate_bina
 from scene_map import SceneMap
 
 
-# 26-connectivity for smoother pathfinding
 VOXEL_MOVES = [
     (dx, dy, dz)
     for dx in (-1, 0, 1)
@@ -182,18 +181,16 @@ class PathPlanner:
     def _bfs_interior(self, start: Tuple[int, int, int]) -> Tuple[Tuple[int, int, int], float]:
         visited = {start}
         q = deque([(start, 0)])
-        visited = {start}
         farthest = start
         max_dist = 0
         
         while q:
-            curr, dist = q.popleft()
+            node, dist = q.popleft()
             if dist > max_dist:
                 max_dist = dist
-                farthest = curr
+                farthest = node
             
-            for dx, dy, dz in VOXEL_MOVES:
-                nbr = (curr[0]+dx, curr[1]+dy, curr[2]+dz)
+            for nbr in self._neighbors(node):
                 if nbr in visited: continue
                 nx, ny, nz = nbr
                 if not self._is_valid(nx, ny, nz): continue
@@ -264,113 +261,77 @@ class PathPlanner:
         path.reverse()
         return path
 
-    def plan_orbit(self, num_frames=600) -> Trajectory:
-        print("[Planner] Generating safe orbit trajectory...")
-        assert self.scene.bounds is not None
-        assert self.scene.centroid is not None
-        
-        radius = self.scene.bounds.max_dimension * 0.8
-        y_level = self.scene.centroid[1] + (self.scene.bounds.max_dimension * 0.2)
-        center = self.scene.centroid
-        
-        poses = []
-        for i in range(num_frames):
-            theta = 2 * math.pi * (i / num_frames)
-            x = center[0] + radius * math.cos(theta)
-            z = center[2] + radius * math.sin(theta)
-            pos = np.array([x, y_level, z])
-            poses.append(CameraPose(position=pos, rotation=self._look_at(pos, center)))
-            
-        return Trajectory(poses=poses, mode="orbit")
-
     def _smooth_path(self, points: np.ndarray, num_frames: int) -> Tuple[np.ndarray, np.ndarray]:
-        points = points[np.insert(np.diff(points, axis=0).astype(bool).any(1), 0, True)]
         if len(points) < 4:
-            t_curr = np.linspace(0, 1, len(points))
-            t_new = np.linspace(0, 1, num_frames)
-            res = np.zeros((num_frames, 3))
-            tan = np.zeros((num_frames, 3))
-            for i in range(3):
-                res[:, i] = np.interp(t_new, t_curr, points[:, i])
-            tan[1:] = res[1:] - res[:-1]
-            tan[0] = tan[1]
-            return res, tan
-
-        dists = np.zeros(len(points))
-        dists[1:] = np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))
-        dists /= dists[-1]
-        
-        cs = CubicSpline(dists, points, bc_type='periodic')
-        ts = np.linspace(0, 1, num_frames)
-        return cs(ts), cs(ts, 1)
+            t = np.linspace(0, 1, len(points))
+            ts = np.linspace(0, 1, num_frames)
+            interp = np.stack([np.interp(ts, t, points[:, dim]) for dim in range(3)], axis=-1)
+            tangents = np.gradient(interp, axis=0)
+            return interp, tangents
+        distances = np.zeros(len(points))
+        distances[1:] = np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))
+        total_dist = distances[-1]
+        for i in range(1, len(distances)):
+            if distances[i] <= distances[i - 1]: distances[i] = distances[i - 1] + 1e-4
+        splines = [CubicSpline(distances, points[:, dim], bc_type="natural") for dim in range(3)]
+        lin_t = np.linspace(0, 1, num_frames)
+        smooth_t = 6*(lin_t**5) - 15*(lin_t**4) + 10*(lin_t**3)
+        sample_dists = smooth_t * total_dist
+        interp = np.stack([s(sample_dists) for s in splines], axis=-1)
+        tangents = np.stack([s(sample_dists, 1) for s in splines], axis=-1)
+        return interp, tangents
 
     def _orientations_from_tangents(self, positions: np.ndarray, tangents: np.ndarray) -> np.ndarray:
         quats = []
         for i in range(len(positions)):
-            t = tangents[i]
-            # Normalize tangent (Forward direction)
-            if np.linalg.norm(t) < 1e-6:
-                forward = np.array([0.0, 0.0, 1.0])
-            else:
-                forward = t / np.linalg.norm(t)
-            
-            # --- FIX: Construct Safe Rotation Matrix (Det=1) ---
-            # Camera looks down -Z. So Camera Z-axis = -Forward
-            z_axis = -forward
-            
-            # World Up (Approximate)
-            world_up = np.array([0.0, 1.0, 0.0])
-            
-            # Camera X (Right) = cross(Z_axis, WorldUp)
-            # (If Z is Back, and Up is Up, then Right is Z x Up?)
-            # Let's test: Z=(0,0,-1) [Back], Up=(0,1,0). 
-            # (-1)k x j = -(-i) = i = (1,0,0). Correct.
-            x_axis = np.cross(z_axis, world_up)
-            
-            if np.linalg.norm(x_axis) < 1e-3:
-                # Singularity (Looking straight up/down)
-                x_axis = np.array([1.0, 0.0, 0.0])
-            
-            x_axis /= np.linalg.norm(x_axis)
-            
-            # Camera Y (Up) = cross(Z, X)
-            # k x i = j. Correct.
-            y_axis = np.cross(z_axis, x_axis)
-            y_axis /= np.linalg.norm(y_axis)
-            
-            # Matrix columns: [Right, Up, Back]
-            rot_mat = np.stack([x_axis, y_axis, z_axis], axis=1)
-            
-            r = R.from_matrix(rot_mat)
-            quats.append(r.as_quat())
-            
-        # Smooth rotations
-        slerp_quats = [quats[0]]
+            tan = tangents[i]
+            if np.linalg.norm(tan) < 1e-6: tan = np.array([0.0, 0.0, 1.0])
+            forward = tan / (np.linalg.norm(tan) + 1e-9)
+            up = np.array([0.0, 1.0, 0.0])
+            if abs(np.dot(forward, up)) > 0.95: up = np.array([1.0, 0.0, 0.0])
+            right = np.cross(up, forward)
+            right /= (np.linalg.norm(right) + 1e-9)
+            up_corrected = np.cross(forward, right)
+            rot_mat = np.stack([right, up_corrected, -forward], axis=1)
+            if np.linalg.det(rot_mat) < 0: rot_mat[:, 0] *= -1
+            q = R.from_matrix(rot_mat).as_quat()
+            quats.append(q)
+        quats = np.array(quats)
+        smoothed_quats = [quats[0]]
+        alpha = 0.05 
+        curr_rot = R.from_quat(quats[0])
         for i in range(1, len(quats)):
-            prev = R.from_quat(slerp_quats[-1])
-            curr = R.from_quat(quats[i])
-            key_times = [0, 1]
-            key_rots = R.from_quat([prev.as_quat(), curr.as_quat()])
-            interpolator = Slerp(key_times, key_rots)
-            slerp_quats.append(interpolator([0.1])[0].as_quat())
-            
-        return np.array(slerp_quats)
+            target_rot = R.from_quat(quats[i])
+            key_rots = R.from_quat(np.stack([curr_rot.as_quat(), target_rot.as_quat()]))
+            slerp = Slerp([0, 1], key_rots)
+            curr_rot = slerp([alpha])[0]
+            smoothed_quats.append(curr_rot.as_quat())
+        return np.array(smoothed_quats)
 
     def _look_at(self, position, target):
         forward = target - position
-        if np.linalg.norm(forward) < 1e-6:
-            forward = np.array([0.0, 0.0, 1.0])
-        else:
-            forward /= np.linalg.norm(forward)
-            
-        # Use same robust logic as above
-        z_axis = -forward
-        world_up = np.array([0.0, 1.0, 0.0])
-        x_axis = np.cross(z_axis, world_up)
-        if np.linalg.norm(x_axis) < 1e-3: x_axis = np.array([1.0, 0.0, 0.0])
-        x_axis /= np.linalg.norm(x_axis)
-        y_axis = np.cross(z_axis, x_axis)
-        y_axis /= np.linalg.norm(y_axis)
-        
-        rot_mat = np.stack([x_axis, y_axis, z_axis], axis=1)
-        return R.from_matrix(rot_mat).as_quat()
+        if np.linalg.norm(forward) < 1e-6: forward = np.array([0.0, 0.0, 1.0])
+        forward /= np.linalg.norm(forward)
+        up = np.array([0.0, 1.0, 0.0])
+        if abs(np.dot(forward, up)) > 0.95: up = np.array([1.0, 0.0, 0.0])
+        right = np.cross(up, forward)
+        right /= np.linalg.norm(right) + 1e-9
+        up_corrected = np.cross(forward, right)
+        rot = np.stack([right, up_corrected, -forward], axis=1)
+        if np.linalg.det(rot) < 0: rot[:, 0] *= -1
+        return R.from_matrix(rot).as_quat()
+
+    def _look_forward(self, forward):
+        forward = forward / (np.linalg.norm(forward) + 1e-9)
+        up = np.array([0.0, 1.0, 0.0])
+        if abs(np.dot(forward, up)) > 0.95: up = np.array([1.0, 0.0, 0.0])
+        right = np.cross(up, forward)
+        right /= np.linalg.norm(right) + 1e-9
+        up_corrected = np.cross(forward, right)
+        rot = np.stack([right, up_corrected, -forward], axis=1)
+        if np.linalg.det(rot) < 0: rot[:, 0] *= -1
+        return R.from_matrix(rot).as_quat()
+
+    @staticmethod
+    def _euclidean(a, b):
+        return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
