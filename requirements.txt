@@ -5,3 +5,4 @@ imageio
 # Optional for rendering; install on GPU machine
 torch
 gsplat
+ultralytics
