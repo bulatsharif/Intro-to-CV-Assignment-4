@@ -2,110 +2,107 @@
 
 ## **🎥 Overview**
 
-This project implements an intelligent autonomous agent capable of exploring 3D Gaussian Splatting scenes. It analyzes the geometry of a point cloud, plans professional cinematic paths, avoids obstacles, and generates high-quality rendered videos with optional object detection.
+This project implements an intelligent autonomous agent capable of exploring 3D Gaussian Splatting scenes. It ingests raw PLY point clouds, analyzes the geometry via voxelization, plans collision-free cinematic paths using a cost-aware A* algorithm, and generates rendered videos with semantic object detection.
 
 **Key Features:**
 
-* **Robust Navigation:** Uses Voxel-based A\* with Distance Fields to keep the camera inside buildings.  
-* **Vertical Clamping:** Automatically detects floor and ceiling heights to prevent the agent from escaping into the sky/void.  
-* **Cinematic Smoothing:** Cubic Spline interpolation with smoothstep (ease-in/ease-out) acceleration.  
-* **Smart Heuristics:** Automatically switches between **Orbit Mode** (for small objects) and **Explorer Mode** (for large environments).  
-* **Hybrid Computer Vision:** Combines 2D YOLOv8 detection with 3D Ray-Casting against the voxel map for 3D localization.
+* **Hybrid Navigation Modes:** Automatically detects scene scale to switch between **Orbit Mode** (for object-centric scenes) and **Explorer Mode** (for indoor environments).
+* **Voxel-Based Safety:** Discretizes the scene into a grid to prevent wall clipping.
+* **Cinematic Smoothing:** Uses Cubic Splines and SLERP (Spherical Linear Interpolation) for drone-like camera motion.
+* **Vertical Containment:** Features "Vertical Clamping" and "Sandwich Start" algorithms to keep the agent inside buildings and prevent it from flying out of the roof.
+* **Integrated Rendering:** A custom wrapper around gsplat for high-performance CUDA rendering.
+* **Visual Analytics:** Integrated YOLOv8 for 2D semantic object labeling on the final video.
 
 ## **🛠️ Installation**
 
 ### **Prerequisites**
 
-* Python 3.8+  
-* CUDA-enabled GPU (Required for rendering)
+* Python 3.8+
+* **CUDA-enabled GPU** (Required for the gsplat renderer)
 
 ### **Setup**
 
-1. Clone the repository:  
-   git clone \<repository\_url\>  
-   cd \<repository\_name\>
+1. **Clone the repository:**
+   ```bash
+   git clone <repository_url>
+   cd <repository_name>
+   ```
 
-2. Install dependencies:  
-   pip install \-r requirements.txt
+2. **Install Dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-   *Note: For the renderer, gsplat requires a CUDA-compatible environment.*  
-3. Install Object Detection weights (Automatic on first run):  
-   pip install ultralytics
+   *Note: gsplat requires a working CUDA toolkit environment.*
 
 ## **🚀 Usage Guide**
 
-### **Basic Command (Generate Path Only)**
+### **1. Basic Path Generation (CPU Only)**
 
-Generate a camera path without rendering (fast, runs on CPU):
+If you only want to calculate the camera trajectory without rendering pixels (useful for debugging the path):
 
-python src/main.py \--ply input-data/scene.ply \--frames 1800
+```bash
+python src/main.py --ply input-data/scene.ply --frames 600
+```
 
-### **Full Render Pipeline**
+*Output:* Creates camera_path.json and .npz files in outputs/.
 
-Generate the path, render frames using CUDA, and assemble a video:
+### **2. Full Pipeline (Render + Video)**
 
-python src/main.py \\  
-  \--ply input-data/ConferenceHall\_uncompressed.ply \\  
-  \--render \--render\_backend gsplat \--device cuda \\  
-  \--width 800 \--height 800 \\  
-  \--frames 1800 \\  
-  \--video \\  
-  \--output\_dir outputs/demo\_run
+To generate the path, render the frames using CUDA, and compile an MP4:
 
-### **With Object Detection (Bonus)**
+```bash
+python src/main.py \
+  --ply input-data/ConferenceHall.ply \
+  --render --render_backend gsplat \
+  --width 800 --height 800 \
+  --video
+```
 
-Enable YOLO detection and 3D localization overlays:
+### **3. Object Detection (Bonus)**
 
-python src/main.py \\  
-  \--ply input-data/scene.ply \\  
-  \--render \--render\_backend gsplat \\  
-  \--detect \--video \\  
-  \--frames 1800
+Apply YOLOv8 detection overlays to the rendered video:
 
-### **Key Flags**
+```bash
+python src/main.py \
+  --ply input-data/ConferenceHall.ply \
+  --render --render_backend gsplat \
+  --detect --yolo_model yolov8n.pt \
+  --video
+```
+
+### **Key Arguments**
 
 | Flag | Description | Default |
 | :---- | :---- | :---- |
-| \--ply | Path to the .ply Gaussian Splat file. | Required |
-| \--voxel\_size | Resolution of the navigation grid (meters). | 0.5 |
-| \--opacity\_threshold | Minimum opacity to consider a point "solid". | 0.2 |
-| \--detect | Enable YOLO object detection \+ 3D localization. | False |
-| \--video | Assemble rendered frames into MP4. | False |
+| --ply | Path to the .ply file. | required |
+| --voxel_size | Grid resolution in meters. | 0.5 |
+| --frames | Total number of frames in the video. | 600 |
+| --render | Enable rendering (requires GPU). | False |
+| --detect | Run YOLO object detection on frames. | False |
+| --packed | Use packed memory layout for faster rendering. | True |
 
 ## **🧠 Algorithm Descriptions**
 
-### **1\. Scene Analysis (src/scene\_map.py)**
+### **Scene Analysis (src/scene_map.py)**
 
-The system ingests the PLY file and converts the sparse cloud into a **Binary Voxel Grid**.
+* **Ingestion:** Reads PLY files, handling both probability (0-1) and logit (raw) opacity scales via heuristic detection.
+* **Voxelization:** Points are filtered by opacity (threshold 0.2) and mapped to a 3D binary grid.
+* **Robust Bounds:** Uses 1st and 99th percentiles to determine scene boundaries, ignoring floating noise artifacts.
 
-* **Noise Filtering:** Discards points with opacity \< 0.2.  
-* **Voxelization:** Discretizes the world into 0.5m cubes.  
-* **Robust Bounds:** Uses 1st-99th percentile to ignore "floater" artifacts common in scanned data.
+### **Path Planning (src/path_planner.py)**
 
-### **2\. The "Vertical Clamp" Planner (src/path\_planner.py)**
+* **Cost Map:** Computes a **Euclidean Distance Transform (EDT)**. Voxels near walls have high costs; open spaces have low costs. This creates a "gravity field" pulling the camera to the center of rooms.
+* **Vertical Sandwich:** To find a safe start point, the planner scans the center Y-column of the grid to find the largest vertical gap between "floor" and "ceiling" voxels.
+* **Smoothing:** Raw A* grid paths are smoothed using scipy.interpolate.CubicSpline for positions and spherical interpolation for rotations.
 
-Standard A\* algorithms often "leak" out of buildings through windows or open roofs. Our planner solves this with three distinct layers of logic:
+### **Rendering (src/renderer.py)**
 
-* **Vertical Sandwich Start:** To ensure the agent starts inside the building, we scan the vertical column at the center of the map. We identify the largest "gap" between solid voxels (representing the space between floor and ceiling) and place the start point there.  
-* **Vertical Clamping:** We calculate the 5th and 90th percentiles of the scene's height. Any voxel below the floor or above the ceiling is assigned infinite cost, forming a "lid" on the environment.  
-* **Cost Map & Ceiling Check:**  
-  * We compute a Euclidean Distance Transform (EDT) to create a "gravity" field that pulls the camera toward the center of rooms ($Cost \= 1 \+ \\frac{10}{Dist}$).  
-  * During A\* traversal, we perform a **Ceiling Check**: If a node has no solid voxels above it (meaning it's outdoors/under the sky), we add a massive penalty, forcing the agent to stay under the roof.
-
-### **3\. Rendering Engine (src/renderer.py)**
-
-A custom wrapper around gsplat.
-
-* **Fixes:** Correctly interprets log-scale sizes (exp) and logit opacities (sigmoid) found in standard PLY files.  
-* **Sorting:** Properly sorts Spherical Harmonics coefficients to prevent color noise artifacts.
-
-### **4\. 3D Object Detection (src/detector.py)**
-
-* **2D Step:** YOLOv8 detects bounding boxes in the rendered frame.  
-* **3D Step (Ray Casting):** A ray is cast from the camera center through the pixel coordinates. The ray marches through the **Voxel Grid** until it hits an Occupied voxel. This returns the precise 3D world coordinate of the object.
+* **Data Normalization:** Automatically detects if scale/opacity parameters need Exp/Sigmoid activations.
+* **SH Sorting:** Ensures Spherical Harmonics coefficients are loaded in the correct order to prevent color artifacts.
 
 ## **⚠️ Known Limitations**
 
-1. **Glass Surfaces:** Transparent glass has low opacity and may be ignored by the voxelizer, potentially causing collisions if the navigation grid doesn't register it as a wall.  
-2. **Disconnected Floors:** If a multi-story building connects floors via a staircase narrower than the voxel\_size (0.5m), the planner might view the floors as disconnected islands.  
-3. **Open-Air Scenes:** The "Ceiling Check" logic assumes an indoor environment. For strictly outdoor scenes (like a park), the "Explorer" mode might struggle to find a "roof," though the cost map will still guide it through open spaces.
+1. **2D-Only Detection:** The current object detector provides 2D bounding boxes on the video. It does not yet map these detections back to 3D world coordinates.
+2. **Memory Usage:** Large scenes (>2M points) may require significant VRAM. Use --max_points to subsample if you run out of memory.
+3. **Glass Surfaces:** Highly transparent surfaces (opacity < threshold) may be treated as empty space, potentially causing collision issues in glass-heavy scenes.
